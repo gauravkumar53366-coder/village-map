@@ -1,0 +1,311 @@
+<!doctype html>
+<html lang="hi">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Plot Locator — GitHub-ready</title>
+
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+<style>
+  html,body{height:100%;margin:0;padding:0;font-family:Arial,Helvetica,sans-serif}
+  #map{height:100%;width:100%}
+
+  /* top control panel */
+  .topPanel{
+    position: absolute; left:10px; top:10px; z-index:1400;
+    background:#fff; padding:10px; border-radius:10px; box-shadow:0 8px 24px rgba(0,0,0,0.12);
+    min-width:220px;
+  }
+  .topPanel .row{display:flex;gap:8px;flex-wrap:wrap}
+  .btn{padding:8px 10px;border-radius:8px;border:none;cursor:pointer;font-size:14px}
+  .btn.primary{background:#1976d2;color:#fff}
+  .btn.secondary{background:#4caf50;color:#fff}
+  .toggleBtn{background:#fff;border:1px solid #ddd;border-radius:8px;padding:6px 8px;cursor:pointer}
+
+  .info{margin-top:6px;font-size:13px;color:#222}
+
+  /* bottom search */
+  .searchBar{
+    position: fixed; left:50%; transform:translateX(-50%); bottom:14px; z-index:1400;
+    background:#fff; padding:8px; border-radius:10px; box-shadow:0 8px 24px rgba(0,0,0,0.12);
+    display:flex; gap:8px; align-items:center; width:calc(100% - 40px); max-width:900px;
+  }
+  .searchBar input{flex:1;padding:10px;border:1px solid #ddd;border-radius:6px;font-size:15px}
+  .searchBar button{padding:8px 12px;border-radius:6px;border:none;background:#ff5722;color:#fff;cursor:pointer;font-size:15px}
+
+  .msg{position:fixed;left:50%;transform:translateX(-50%);top:18px;background:#fff;padding:8px 12px;border-radius:8px;box-shadow:0 8px 24px rgba(0,0,0,0.15);z-index:1500;display:none}
+
+  /* zoom control left-center */
+  .leaflet-control-zoom{ top:50% !important; transform:translateY(-50%); left:10px !important; }
+
+  @media (max-width:420px){
+    .topPanel{min-width:180px}
+    .searchBar input{font-size:14px}
+  }
+</style>
+</head>
+<body>
+  <div id="map" aria-hidden="false"></div>
+
+  <div class="topPanel" role="region" aria-label="Controls">
+    <div style="font-weight:700;margin-bottom:6px">Plot Locator (हिन्दी)</div>
+
+    <div class="row">
+      <button id="btnLocate" class="btn primary" title="मेरी लोकेशन ढूँढो">📍 मेरी लोकेशन</button>
+      <button id="btnFit" class="btn secondary" title="पूरा मैप दिखाओ">🗺️ पूरा मैप दिखाओ</button>
+    </div>
+
+    <div style="margin-top:8px;" class="row">
+      <button id="btnToggleLabels" class="toggleBtn" title="प्लॉट नंबर दिखाएँ/छुपाएँ">प्लॉट नंबर दिखाएँ</button>
+      <button id="btnVoiceToggle" class="toggleBtn" title="आवाज़ चालू/बंद">आवाज़: चालू</button>
+    </div>
+
+    <div class="info" id="info">मैप लोड हो रहा है…</div>
+  </div>
+
+  <div class="searchBar" role="search" aria-label="Plot search">
+    <input id="plotInput" placeholder="प्लॉट नंबर डालें या 🎤 से बोलें" aria-label="Plot number"/>
+    <button id="micBtn" title="बोलकर सर्च करें">🎤</button>
+    <button id="searchBtn" title="प्लॉट खोजें">🔍</button>
+  </div>
+
+  <div id="msg" class="msg" role="status"></div>
+
+  <!-- libs -->
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@turf/turf@6/turf.min.js"></script>
+  <script src="https://unpkg.com/leaflet.locatecontrol/dist/L.Control.Locate.min.js"></script>
+
+  <script>
+  // CONFIG
+  const GEOJSON_FILE = 'plots.geojson'; // rename your file to this (put in same repo root)
+  const PLOT_PROP = 'Name';              // property name that contains plot number
+  const DEFAULT_CENTER = [25.339365,85.765942];
+  const DEFAULT_ZOOM = 18;
+  const MAX_ZOOM = 22;
+
+  // STATE
+  let plotsLayer = null;
+  let labelsLayer = L.layerGroup();
+  let labelsShown = true;
+  let voiceEnabled = true;
+  let userMarker = null;
+  let highlightLayer = null;
+  let watchId = null;
+
+  // MAP
+  const map = L.map('map', { maxZoom: MAX_ZOOM, minZoom: 13, zoomControl: false }).setView(DEFAULT_CENTER, DEFAULT_ZOOM);
+
+  // try Google Satellite tiles; if blocked by provider, user can switch to Esri by uncommenting fallback
+  const googleSat = L.tileLayer('https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}', { maxZoom: MAX_ZOOM, attribution: '© Google' });
+  googleSat.addTo(map);
+
+  // add zoom control at left (we will move it center via CSS above)
+  L.control.zoom({ position: 'topleft' }).addTo(map);
+
+  // add locate control (optional UI)
+  L.control.locate && L.control.locate({ position: 'topleft', strings: { title: "मेरी लोकेशन" } }).addTo(map);
+
+  // helper messages
+  function showMsg(text, ms=2500){ const e=document.getElementById('msg'); e.style.display='block'; e.innerText=text; setTimeout(()=> e.style.display='none', ms); }
+
+  // fetch GeoJSON
+  fetch(GEOJSON_FILE)
+  .then(r => { if(!r.ok) throw new Error('GeoJSON load error ' + r.status); return r.json(); })
+  .then(data => {
+    // create plots layer
+    plotsLayer = L.geoJSON(data, {
+      style: f => ({ color:'#ff7800', weight:1.5, fillOpacity:0.08 }),
+      onEachFeature: (feature, layer) => {
+        const plotNo = feature.properties && (feature.properties[PLOT_PROP] || feature.properties.plot_no || feature.properties.id) ? (feature.properties[PLOT_PROP]||feature.properties.plot_no||feature.properties.id) : 'Unknown';
+        // compute area
+        let areaSqFt = 'N/A';
+        try{ const a = turf.area(feature); areaSqFt = (a * 10.763910416709722).toFixed(2); }catch(e){}
+        // centroid
+        let centroid = [0,0];
+        try{ const c=turf.centroid(feature).geometry.coordinates; centroid=[c[1],c[0]];}catch(e){}
+        const popup = `<div><strong>Plot: ${plotNo}</strong><br>Area: ${areaSqFt} sq ft<br>
+          <a href="https://www.google.com/maps/search/?api=1&query=${centroid[0]},${centroid[1]}" target="_blank" rel="noopener">Google Maps में खोलें</a></div>`;
+        layer.bindPopup(popup);
+
+        layer.on('click', () => {
+          // highlight & speak
+          highlightFeature(feature);
+          setInfo(`Plot: ${plotNo} — Area: ${areaSqFt} sq ft`);
+          if(voiceEnabled) speakHindi(`आप प्लॉट नंबर ${plotNo} पर हैं। इसका क्षेत्रफल ${areaSqFt} वर्ग फीट है।`);
+        });
+      }
+    }).addTo(map);
+
+    // labels
+    buildLabels(data);
+
+    // fit map
+    const b = plotsLayer.getBounds();
+    if(b && b.isValid && b.isValid()) map.fitBounds(b, { padding:[20,20] });
+    else map.setView(DEFAULT_CENTER, DEFAULT_ZOOM);
+
+    document.getElementById('info').innerText = 'मैप लोड हो गया है। "मेरी लोकेशन" दबाकर आज़माएँ।';
+  })
+  .catch(err => {
+    console.error(err);
+    document.getElementById('info').innerText = 'GeoJSON लोड एरर: ' + err.message;
+    showMsg('GeoJSON लोड एरर: ' + err.message, 5000);
+    map.setView(DEFAULT_CENTER, DEFAULT_ZOOM);
+  });
+
+  // build labels function
+  function buildLabels(geojson){
+    labelsLayer.clearLayers();
+    if(!geojson || !geojson.features) return;
+    geojson.features.forEach(f=>{
+      try{
+        const c = turf.centroid(f).geometry.coordinates;
+        const plotNo = (f.properties && (f.properties[PLOT_PROP] || f.properties.plot_no || f.properties.id)) ? (f.properties[PLOT_PROP] || f.properties.plot_no || f.properties.id) : '';
+        const m = L.marker([c[1], c[0]], {
+          icon: L.divIcon({ className:'plot-label', html:`<div style="background:rgba(255,255,255,0.95);padding:3px 6px;border-radius:6px;border:1px solid #ddd;font-weight:600">${plotNo}</div>` })
+        });
+        labelsLayer.addLayer(m);
+      }catch(e){}
+    });
+    if(labelsShown) map.addLayer(labelsLayer);
+  }
+
+  // toggle labels
+  document.getElementById('btnToggleLabels').addEventListener('click', ()=>{
+    labelsShown = !labelsShown;
+    if(labelsShown){ map.addLayer(labelsLayer); document.getElementById('btnToggleLabels').innerText='प्लॉट नंबर दिखाएँ'; }
+    else{ map.removeLayer(labelsLayer); document.getElementById('btnToggleLabels').innerText='प्लॉट नंबर छुपाएँ'; }
+  });
+
+  // fit button
+  document.getElementById('btnFit').addEventListener('click', ()=>{
+    if(plotsLayer){
+      const b = plotsLayer.getBounds();
+      if(b && b.isValid && b.isValid()) map.fitBounds(b, { padding:[20,20] });
+    } else showMsg('Plots अभी लोड नहीं हुए');
+  });
+
+  // locate/watch
+  document.getElementById('btnLocate').addEventListener('click', ()=>{
+    if(!navigator.geolocation){ showMsg('ब्राउज़र में Geolocation सपोर्ट नहीं है',4000); return; }
+    showMsg('लोकेशन मांगी जा रही है — परमिशन दें',2000);
+    navigator.geolocation.getCurrentPosition(posSuccess, posError, { enableHighAccuracy:true, timeout:15000 });
+    if(navigator.geolocation && !watchId){
+      watchId = navigator.geolocation.watchPosition(posSuccess, posError, { enableHighAccuracy:true, maximumAge:1000, timeout:20000 });
+    }
+  });
+
+  function posSuccess(pos){
+    const lat = pos.coords.latitude, lng = pos.coords.longitude;
+    const latlng = L.latLng(lat,lng);
+    if(userMarker) map.removeLayer(userMarker);
+    userMarker = L.circleMarker(latlng, { radius:7, color:'#1976d2', fillColor:'#1976d2', fillOpacity:1 }).addTo(map);
+    map.setView(latlng, Math.min(MAX_ZOOM, 19));
+
+    // find plot containing this point
+    let found = null;
+    if(plotsLayer){
+      plotsLayer.eachLayer(layer=>{
+        try{
+          if(turf.booleanPointInPolygon(turf.point([lng,lat]), layer.toGeoJSON())) found = layer.toGeoJSON();
+        }catch(e){}
+      });
+    }
+    if(found){
+      const plotNo = (found.properties && (found.properties[PLOT_PROP]||found.properties.plot_no||found.properties.id)) ? (found.properties[PLOT_PROP]||found.properties.plot_no||found.properties.id) : 'Unknown';
+      const areaSqFt = (turf.area(found) * 10.763910416709722).toFixed(2);
+      highlightFeature(found);
+      setInfo(`आप इस प्लॉट पर खड़े हैं: ${plotNo} — Area: ${areaSqFt} sq ft`);
+      if(voiceEnabled) speakHindi(`आप प्लॉट नंबर ${plotNo} पर हैं। इसका क्षेत्रफल ${areaSqFt} वर्ग फीट है।`);
+    } else {
+      setInfo('आप किसी भी प्लॉट के अंदर नहीं हैं।');
+      if(voiceEnabled) speakHindi('आप किसी भी प्लॉट के अंदर नहीं हैं।');
+    }
+  }
+  function posError(err){
+    console.warn('pos err', err);
+    if(err && err.code === 1) showMsg('Location permission denied — site settings से allow करें',6000);
+    else showMsg('Location error: ' + (err && err.message ? err.message : err),4000);
+  }
+
+  // highlight helper
+  function highlightFeature(feature){
+    try{ if(highlightLayer) map.removeLayer(highlightLayer); }catch(e){}
+    highlightLayer = L.geoJSON(feature, { style:{ color:'#00bfa5', weight:3, fillOpacity:0.25 } }).addTo(map);
+    try{ const b = L.geoJSON(feature).getBounds(); if(b && b.isValid) map.fitBounds(b, { padding:[20,20] }); }catch(e){}
+  }
+
+  // info box
+  function setInfo(text){ document.getElementById('info').innerText = text; }
+
+  // search functions
+  document.getElementById('searchBtn').addEventListener('click', doSearch);
+  document.getElementById('plotInput').addEventListener('keydown', (e)=>{ if(e.key==='Enter') doSearch(); });
+
+  function doSearch(){
+    const q = document.getElementById('plotInput').value.trim();
+    if(!q){ showMsg('कृपया प्लॉट नंबर डालें',2000); return; }
+    if(!plotsLayer){ showMsg('Plots अभी लोड नहीं हुए',2000); return; }
+    let found = null;
+    plotsLayer.eachLayer(layer=>{
+      try{
+        const val = layer.feature && (layer.feature.properties[PLOT_PROP]||layer.feature.properties.plot_no||layer.feature.properties.id) ? (layer.feature.properties[PLOT_PROP]||layer.feature.properties.plot_no||layer.feature.properties.id) : '';
+        if(String(val) === q) found = layer.toGeoJSON();
+      }catch(e){}
+    });
+    if(found){
+      highlightFeature(found);
+      const area = (turf.area(found) * 10.763910416709722).toFixed(2);
+      const c = turf.centroid(found).geometry.coordinates;
+      setInfo(`Plot: ${q} — Area: ${area} sq ft`);
+      if(voiceEnabled) speakHindi(`प्लॉट नंबर ${q} दिखाया जा रहा है। इसका क्षेत्रफल ${area} वर्ग फीट।`);
+      L.popup({ maxWidth:300 }).setLatLng([c[1],c[0]]).setContent(`<div><strong>Plot: ${q}</strong><br>Area: ${area} sq ft<br><a href="https://www.google.com/maps/search/?api=1&query=${c[1]},${c[0]}" target="_blank" rel="noopener">Google Maps में खोलें</a></div>`).openOn(map);
+    } else {
+      showMsg('प्लॉट नहीं मिला: ' + q, 3000);
+      if(voiceEnabled) speakHindi(`प्लॉट नंबर ${q} नहीं मिला`);
+    }
+  }
+
+  // voice search (microphone)
+  document.getElementById('micBtn').addEventListener('click', startVoiceSearch);
+  function startVoiceSearch(){
+    const SpeechRec = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if(!SpeechRec){ showMsg('यह ब्राउज़र वॉइस सर्च सपोर्ट नहीं करता',4000); return; }
+    const rec = new SpeechRec();
+    rec.lang = 'hi-IN';
+    rec.interimResults = false;
+    rec.maxAlternatives = 1;
+    rec.onstart = ()=> showMsg('बोल कर प्लॉट नंबर बताइए...',2000);
+    rec.onresult = (ev)=> {
+      const spoken = ev.results[0][0].transcript.trim();
+      document.getElementById('plotInput').value = spoken;
+      doSearch();
+    };
+    rec.onerror = e => { console.warn('speech err', e); showMsg('Speech error',3000); };
+    rec.start();
+  }
+
+  // toggle voice
+  document.getElementById('btnVoiceToggle').addEventListener('click', ()=>{
+    voiceEnabled = !voiceEnabled;
+    document.getElementById('btnVoiceToggle').innerText = 'आवाज़: ' + (voiceEnabled ? 'चालू' : 'बंद');
+    showMsg('आवाज़ ' + (voiceEnabled ? 'चालू' : 'बंद'),1200);
+  });
+
+  // speak helper (hindi)
+  function speakHindi(txt){
+    try{
+      window.speechSynthesis.cancel();
+      const u = new SpeechSynthesisUtterance(txt);
+      u.lang = 'hi-IN';
+      window.speechSynthesis.speak(u);
+    }catch(e){ console.warn('TTS err', e); }
+  }
+
+  // expose debug
+  window._debug = { plotsLayer, labelsLayer, geojsonData: window.geojsonData };
+
+  </script>
+</body>
+</html>
